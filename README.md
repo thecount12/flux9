@@ -8,7 +8,7 @@ Build history and phase checklist: [PLAN.md](PLAN.md).
 
 ## What you actually built
 
-Not a full OS, not a BLAS, not an LLM runtime. You built three layers that stack:
+Not a full OS, not a BLAS, not an LLM runtime. We built three layers that stack:
 
 | Layer | What it is |
 |---|---|
