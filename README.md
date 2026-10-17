@@ -6,7 +6,7 @@ Build history and phase checklist: [PLAN.md](PLAN.md).
 
 ---
 
-## What you actually built
+## What we actually built
 
 Not a full OS, not a BLAS, not an LLM runtime. We built three layers that stack:
 
