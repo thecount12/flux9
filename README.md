@@ -1,6 +1,6 @@
 # flux9
 
-A tiny **matrix bytecode machine** in pure C. Sixteen registers, each a fixed **4×4 `int16`** tile. One instruction can multiply two tiles. Lux can optionally call into it; Lux does not require it.
+A tiny **matrix bytecode machine** in pure C. Sixteen registers, each a fixed **4×4 `int16`** tile. One instruction can multiply two tiles. A host-side **tiled matmul** covers larger matrices (dims multiple of 4). Lux can optionally call into it; Lux does not require it.
 
 Build history and phase checklist: [PLAN.md](PLAN.md).
 
@@ -8,15 +8,16 @@ Build history and phase checklist: [PLAN.md](PLAN.md).
 
 ## What we actually built
 
-Not a full OS, not a BLAS, not an LLM runtime. We built three layers that stack:
+Not a full OS, not a BLAS, not an LLM runtime. Layers that stack:
 
 | Layer | What it is |
 |---|---|
 | **Tile kernels** (`tile.c`) | `matmul_4x4` / `vadd_4x4` over `int16_t[4][4]` |
 | **VM** (`vm.c`) | Fetch a 32-bit instruction, decode, run `HALT` / `MOV` / `MATMUL` / `VADD` / `LD` / `ST` |
-| **Host API** (`api.c`) | `flux9_matmul` — load two tiles, run `MATMUL T0,T1,T2; HALT`, return `T0` |
+| **Pack** (`pack.c`) | `fill_tile` / `write_tile` for row-major int16 buffers |
+| **Host API** (`api.c`) | `flux9_matmul` (one tile via bytecode); `flux9_matmul_tiled` (large GEMM via tiles) |
 
-The demo binary (`main.c` + `prog.h`) allocates a 64 KiB arena, stores `T1`/`T2` into memory, loads them into `T3`/`T4`, multiplies into `T0`, and checks the known product.
+The demo binary runs the arena program (phase 4) and an 8×8 tiled check (phase 6).
 
 ```
   T0 … T15     each = 4×4 int16  (32 bytes)
@@ -40,10 +41,12 @@ Instruction word: `[opcode:8][dest:4][srcA:4][srcB:4][imm:12]`. Helpers: `ENC(..
 
 **Hard limits (by design today)**
 
-- Tile shape is always 4×4 (`T_SIZE`).
-- Elements should stay in **[-64, 64]** so a 4-wide int16×int16 sum fits in int32.
+- Native register tile is always 4×4 (`T_SIZE`).
+- `flux9_matmul_tiled` requires **M, N, K multiples of 4**; rejects others with `-1`.
+- Per-tile products use int32 inside `matmul_4x4`; tiled path accumulates those in **int32**, then saturates to int16.
+- Element values for Lux conversion stay in **[-64, 64]** by convention.
 - `LD`/`ST` `imm` is 12-bit (first 4 KiB of the arena).
-- No floats inside the VM. Floats only appear at the Lux boundary (convert in, convert out).
+- No floats inside the VM. Floats only appear at the Lux boundary.
 
 ---
 
@@ -52,38 +55,45 @@ Instruction word: `[opcode:8][dest:4][srcA:4][srcB:4][imm:12]`. Helpers: `ENC(..
 ```bash
 cd flux9
 make          # builds ./flux9
-make test     # runs the arena program; expects "phase 4 passed"
-./flux9       # prints T0, then the pass/fail line
+make test     # phase 4 + phase 6
+./flux9
 ```
 
-You should see the product matrix:
+Expect both:
 
 ```text
-     1    13     2    12
-     9    29     2    28
-    17    45     2    44
-    25    61     2    60
 phase 4 passed
+phase 6 passed
 ```
-
-To change the demo: edit `prog.h` (matrices + bytecode), rebuild.
 
 ---
 
 ## How to use it: from C
 
+**One 4×4 tile (bytecode):**
+
 ```c
 #include "api.h"
 
 utensor_t A, B, C;
-/* fill A.data[][] and B.data[][] with int16 values in [-64, 64] */
 flux9_matmul(&C, &A, &B);
-/* C is T0 after MATMUL T0,T1,T2 ; HALT */
 ```
 
-Link `tile.c`, `vm.c`, and `api.c`. That path does **not** need the 64 KiB arena; `flux9_matmul` keeps a tiny code array on the stack and uses registers only.
+**Larger matrices (tiled; dims multiple of 4):**
 
-For a full program (code + `LD`/`ST` in one arena), copy the pattern in `main.c`: `malloc(ARENA_SIZE)`, copy bytecode to offset 0, set `vm.memory` / `vm.pc`, fill registers, `flux9_run`.
+```c
+#include "api.h"
+
+int16_t A[M*K], B[K*N], C[M*N];
+/* fill A, B row-major */
+if (flux9_matmul_tiled(C, A, B, M, N, K) != 0) {
+    /* bad dims — not multiples of 4 */
+}
+```
+
+Link `tile.c`, `pack.c`, `vm.c`, and `api.c`.
+
+The tiled path calls `matmul_4x4` per block (same kernel as `OP_MATMUL`). It does **not** re-enter the bytecode VM on every tile.
 
 ---
 
@@ -92,40 +102,29 @@ For a full program (code + `LD`/`ST` in one arena), copy the pattern in `main.c`
 Lux’s normal `Tensor` path is float32 and does **not** need flux9.
 
 ```bash
-# Lux alone (no flux9)
 cd ../lux/posix
-make
-./lux ../examples/tensor_check.lux
-```
-
-```bash
-# Lux + flux9 seam (sibling checkout at ../../flux9)
-make USE_FLUX9=1
+make                          # Lux alone
+make USE_FLUX9=1              # + flux9 (FLUX9_DIR ?= ../../flux9)
 ./lux ../examples/flux9_tile.lux
+./lux ../examples/flux9_tiled.lux   # 8×8 via tiled API
 ```
-
-Override the path if needed: `make USE_FLUX9=1 FLUX9_DIR=/path/to/flux9`.
-
-In Lux scripts, only when built with `USE_FLUX9=1`:
 
 ```lux
-var A = Tensor(4, 4);
-var B = Tensor(4, 4);
-/* fill with numbers in [-64, 64] */
+var A = Tensor(8, 8);
+var B = Tensor(8, 8);
+/* fill with numbers in [-64, 64]; dims multiple of 4 */
 
-var C = A.matmulFlux9(B);   /* runs flux9 bytecode */
-var D = A.matmul(B);        /* float32 C path — always available */
-
-C.show("via flux9");
+var C = A.matmulFlux9(B);   /* tiled flux9 path when dims > 4×4 */
+var D = A.matmul(B);        /* float32 — always available */
 ```
 
 Rules for `matmulFlux9`:
 
-- Both sides must be exactly **4×4**.
-- Values must round into **[-64, 64]**; otherwise the call returns `nil`.
-- Result is a new float `Tensor` (int16 products written back as floats).
+- Rows/cols of both sides must be **multiples of 4**, and `A.cols == B.rows`.
+- Values must round into **[-64, 64]**; otherwise `nil`.
+- Exact 4×4 still uses the single-tile bytecode path; larger uses `flux9_matmul_tiled`.
 
-Without `USE_FLUX9=1`, `matmulFlux9` is not registered (`Undefined property 'matmulFlux9'`).
+Without `USE_FLUX9=1`, `matmulFlux9` is not registered.
 
 ---
 
@@ -137,14 +136,28 @@ Without `USE_FLUX9=1`, `matmulFlux9` is not registered (`Undefined property 'mat
        │  Tensor.matmul        Tensor.matmulFlux9   (USE_FLUX9=1)
        ▼                            ▼
   lux tensor.c (float32)     tensor_flux9_native.c
-                                    │
-                                    ▼
-                              flux9_matmul (api.c)
-                                    │
-                              vm.c  →  tile.c
+                         ┌──────────┴──────────┐
+                         ▼                     ▼
+                  flux9_matmul          flux9_matmul_tiled
+                  (4×4 bytecode)        (pack + matmul_4x4 loop)
+                         │                     │
+                         └─────────► tile.c ◄──┘
 ```
 
-flux9 stays its own repo. Lux optionally **compiles** three flux9 `.c` files into the `lux` binary. There is no runtime shared library and no requirement to install flux9 for a normal Lux build.
+---
+
+## Further consideration
+
+Pinned for later — see also [PLAN.md](PLAN.md). Classical tiled GEMM is the shipping path.
+
+| Idea | Role vs flux9 |
+|---|---|
+| **Strassen** (2×2 in 7 mults) | Host recursion above flux9, or leaf rewrite of small blocks |
+| **Flip-graph / Moosbauer–Poole schemes** ([arXiv:2502.04514](https://arxiv.org/abs/2502.04514)) | Better bilinear schemes for 5×5 / 6×6; possible future leaf kernels or alternate `T_SIZE` |
+| **Threads / Plan 9 nodes** | Partition `(i,j)` output tiles across workers |
+| **int8 / 4-bit packs** | Density pass after tiled int16 is trusted |
+
+Tiling answers coverage of large matrices. Algebraic schemes answer fewer multiplies **per block**. They compose: scheduler stays; leaf kernel can change.
 
 ---
 
@@ -152,12 +165,11 @@ flux9 stays its own repo. Lux optionally **compiles** three flux9 `.c` files int
 
 | Goal | Do this |
 |---|---|
-| Confirm the machine works | `make test` in this repo |
+| Confirm the machine works | `make test` |
 | Tinker with bytecode | Edit `prog.h`, `make test` |
-| Call from your own C | `#include "api.h"`, link `tile.o vm.o api.o` |
-| Call from Lux | Sibling dirs, `make USE_FLUX9=1`, use `matmulFlux9` |
-| Bigger matrices | Not done yet — need tiling (multiples of 4) + accumulation; see PLAN.md “Next” |
-| LLM / lumen weights | Still in `llmresearch`; flux9 is only the 4×4 tile engine so far |
+| Large int16 GEMM from C | `flux9_matmul_tiled` |
+| Call from Lux | `make USE_FLUX9=1`, `matmulFlux9` |
+| LLM / lumen weights | Still `llmresearch`; feed panels through tiled API when ready |
 
 ---
 
@@ -167,9 +179,10 @@ flux9 stays its own repo. Lux optionally **compiles** three flux9 `.c` files int
 |---|---|
 | `flux9.h` | Registers, arena, opcodes, `ENC` |
 | `tile.c` / `tile.h` | Fixed 4×4 math |
+| `pack.c` / `pack.h` | Matrix ↔ tile slicing |
 | `vm.c` / `vm.h` | Interpreter |
-| `api.c` / `api.h` | Host entry (`flux9_matmul`) |
+| `api.c` / `api.h` | `flux9_matmul`, `flux9_matmul_tiled` |
 | `prog.h` | Demo matrices + bytecode |
-| `main.c` | Arena demo / exit test |
+| `main.c` | Phase 4 + phase 6 exit tests |
 | `research/` | Earlier sketches — not the machine |
 | `PLAN.md` | Phase-by-phase build record |
