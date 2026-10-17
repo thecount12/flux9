@@ -22,8 +22,10 @@ Lux's `tensor` branch (`thecount12/lux`, `front...tensor`) is a separate POSIX `
 | `flux9.h` | The struct above |
 | `tile.c` | `matmul_4x4` and `vadd_4x4`, no bytecode |
 | `vm.c` | Fetch, decode, one switch. Replaces the header copy that is there now |
-| `main.c` | Load a program, run it, print `T0` |
+| `main.c` | Arena demo + tiled exit tests |
 | `prog.h` | The first program as a `uint32_t` array |
+| `pack.c` | `fill_tile` / `write_tile` for row-major buffers |
+| `api.c` | `flux9_matmul` + `flux9_matmul_tiled` |
 
 ## Instruction word
 
@@ -94,14 +96,37 @@ Lux `tensor` merged (`front` @ `c710ebe`, PR #114). Lux keeps `Tensor(rows, cols
 
 Seam:
 - `api.c` / `api.h` — `flux9_matmul` runs `MATMUL T0,T1,T2; HALT` for hosts.
-- Lux `posix/tensor_flux9_native.c` — only file that includes both Lux `tensor.h` and `flux9.h`. Exposes `t.matmulFlux9(b)` for exact 4×4 matrices with elements in `[-64, 64]`.
-- Lux Makefile: optional. Default `USE_FLUX9=0` (lux builds alone). `make USE_FLUX9=1` sets `-DLUX_FLUX9`, `FLUX9_DIR ?= ../../flux9`, and links `tile.c` / `vm.c` / `api.c`.
+- Lux `posix/tensor_flux9_native.c` — only file that includes both Lux `tensor.h` and `flux9.h`. Exposes `t.matmulFlux9(b)` (4×4 via bytecode; larger multiples of 4 via tiled API; elements in `[-64, 64]`).
+- Lux Makefile: optional. Default `USE_FLUX9=0` (lux builds alone). `make USE_FLUX9=1` sets `-DLUX_FLUX9`, `FLUX9_DIR ?= ../../flux9`, and links `tile.c` / `vm.c` / `pack.c` / `api.c`.
 
 Exit tests:
 - `cd lux/posix && make && ./lux ../examples/tensor_check.lux` → `tensor check passed`
 - `make USE_FLUX9=1 && ./lux ../examples/flux9_tile.lux` → `flux9 tile check passed`
 
-Next (not required for phase 5): tile larger matrices (multiples of 4) with int32 accumulation across K-blocks.
+### 6. Tiled large matmul — done
+
+Host-side scheduler in C (not in the Lux compiler):
+
+- `pack.c` — `fill_tile` / `write_tile` over row-major `int16` buffers.
+- `flux9_matmul_tiled(C, A, B, M, N, K)` — dims must be multiples of 4; inner `matmul_4x4`; **int32** accumulation per output tile; saturate to int16 on store.
+- Hot path calls `matmul_4x4` directly (same kernel as `OP_MATMUL`), not a full VM re-entry per tile.
+
+Exit test: `make test` → `phase 4 passed` and `phase 6 passed` (8×8 vs naive reference; non-multiples rejected).
+
+Lux: `matmulFlux9` accepts multiples of 4 and routes through `flux9_matmul_tiled`.
+
+## Further consideration (not scheduled)
+
+These are alternate or complementary tracks — do not block classical tiling.
+
+**Algebraic / bilinear schemes** (Strassen; Moosbauer–Poole flip graphs with symmetry, [arXiv:2502.04514](https://arxiv.org/abs/2502.04514)): fewer scalar multiplies for an \(n \times n\) block (e.g. 2×2 in 7, 5×5 in 93, 6×6 in 153) at the cost of more adds and structured mixes. Orthogonal to tiling: tiling answers “how do I cover a big matrix with small blocks?”; schemes answer “how do I multiply one block with fewer multiplies?”
+
+Possible later weave-ins:
+1. **Leaf kernel swap** — keep `flux9_matmul_tiled`; replace `matmul_4x4` with an algebraic 4×4 (or Strassen on 2×2 subblocks) when a verified scheme exists.
+2. **Host recursion** — Strassen on large panels in C; flux9 only at the leaves.
+3. **Alternate tile size** — native 5×5 / 6×6 registers would be a new `T_SIZE` / ISA, not a drop-in.
+
+Still out of scope until classical tiled int16 is the daily path: threads, Plan 9 grid dispatch, int8/4-bit packs, non-multiple padding, Lux compiler changes.
 
 ## Order of proof
 
@@ -112,3 +137,4 @@ Next (not required for phase 5): tile larger matrices (multiples of 4) with int3
 | 3 | The program is data |
 | 4 | The register file is a window onto the arena |
 | 5 | The seam with Lux |
+| 6 | Large matrices via 4×4 tiles + int32 acc |
